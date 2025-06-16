@@ -4,12 +4,15 @@
   become: true
   vars:
     kubernetes_version: "1.31"
-    calico_version: "v3.29.2"
     pod_network_cidr: "192.168.0.0/16"
     controlplane_ip: "{{ hostvars[groups['controlplane'][0]]['ansible_host'] | default(hostvars[groups['controlplane'][0]]['inventory_hostname']) }}"
     docker_ce_repo_url: "https://download.docker.com/linux/rhel/docker-ce.repo"
     cri_dockerd_version: "0.3.16"
     cni_plugins_version: "v1.5.0"
+    calico_version: "v3.29.2"
+    base_url: "https://raw.githubusercontent.com/projectcalico/calico/"
+    tigera_operator_manifest: "manifests/tigera-operator.yaml"
+    custom_resources_manifest: "manifests/custom-resources.yaml"
 
   tasks:
     - name: Disable Swap
@@ -22,7 +25,6 @@
             regexp: '^([^#].*swap.*)$'
             replace: '#\1'
       when: ansible_os_family == "RedHat"  # Optional: Only if you're sure this is for RHEL-based systems
-
 
     - name: Configure sysctl parameters
       block:
@@ -66,18 +68,42 @@
             replace: 'SELINUX=permissive'
       when: ansible_selinux.status != "disabled"
 
-    - name: Open Required Firewall Ports for Control Plane
-      firewalld:
-        port: "{{ item }}"
-        permanent: true
-        state: enabled
-        immediate: true
+    - name: Add target hostname to 127.0.0.1 line in /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.0\.1\s+.*$'
+        line: "{{ updated_line }}"
+        backrefs: true
+      vars:
+        hostname: "{{ ansible_hostname }}"
+        current_line: "{{ lookup('file', '/etc/hosts') | regex_search('(?m)^127\\.0\\.0\\.1\\s+.*') }}"
+        updated_line: >-
+          {{ current_line + ' ' + hostname if hostname not in current_line else current_line }}
+
+    - name: Install firewalld and python3-firewall
+      ansible.builtin.package:
+        name:
+          - firewalld
+          - python3-firewall
+        state: present
+
+    - name: Ensure firewalld is running
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open required firewall ports manually
+      command: "firewall-cmd --permanent --add-port={{ item }}"
       loop:
         - 6443/tcp
+        - 5473/tcp
         - 10250/tcp
         - 10251/tcp
         - 10252/tcp
         - 2379-2380/tcp
+      notify: Reload Firewall
+      when: ansible_os_family == "RedHat"
 
     - name: Install Docker Engine
       block:
@@ -96,10 +122,9 @@
               - docker-buildx-plugin
               - docker-compose-plugin
             state: present
-        - name: Set Docker cgroup driver to systemd
-          blockinfile:
-            path: /etc/docker/daemon.json
-            create: true
+        - name: Set Docker daemon.json with systemd cgroup driver
+          copy:
+            dest: /etc/docker/daemon.json
             content: |
               {
                 "exec-opts": ["native.cgroupdriver=systemd"],
@@ -109,6 +134,8 @@
                 },
                 "storage-driver": "overlay2"
               }
+            force: yes
+
         - name: Start and enable Docker service
           systemd:
             name: docker
@@ -120,11 +147,11 @@
       block:
         - name: Download cri-dockerd binary
           get_url:
-            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz"
-            dest: /tmp/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz
+            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+            dest: /tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
         - name: Extract cri-dockerd binary
           unarchive:
-            src: /tmp/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz
+            src: /tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
             dest: /tmp/
             remote_src: true
         - name: Install cri-dockerd binary
@@ -169,8 +196,8 @@
             state: started
             enabled: true
           loop:
-            - cri-docker.service
             - cri-docker.socket
+            - cri-docker.service
       when: ansible_os_family == "RedHat"
 
     - name: Install CNI plugins
@@ -185,7 +212,10 @@
             state: directory
             mode: '0755'
         - name: Extract CNI plugins
-          command: tar Cxzvf /tmp/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz -C /opt/cni/bin
+          unarchive:
+            src: /tmp/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz
+            dest: /opt/cni/bin
+            remote_src: true
       when: ansible_os_family == "RedHat"
 
     - name: Install Kubernetes components (kubeadm, kubelet, kubectl)
@@ -234,30 +264,58 @@
         - name: Copy kubeconfig
           command: cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
           become_user: "{{ ansible_user_id }}"
+        # - name: Fix kubeconfig permissions
+        #   command: chown $(id -u):$(id -g) $HOME/.kube/config
+        #   become_user: "{{ ansible_user_id }}"
+
         - name: Fix kubeconfig permissions
-          command: chown $(id -u):$(id -g) $HOME/.kube/config
+          shell: chown $(id -u):$(id -g) $HOME/.kube/config
+          args:
+            executable: /bin/bash
           become_user: "{{ ansible_user_id }}"
-        - name: Deploy Calico
-          kubernetes.core.k8s:
-            state: present
-            src: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml"
-        - name: Apply Calico Custom Resources
-          kubernetes.core.k8s:
-            state: present
-            src: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
+        - name: Ensure kubernetes Python module is installed
+          pip:
+            name: kubernetes
+            executable: /usr/local/bin/pip3
+          become: true
+        - name: Download Tigera Operator manifest
+          get_url:
+            url: "{{ base_url }}{{ calico_version }}/{{ tigera_operator_manifest }}"
+            dest: /tmp/tigera-operator.yaml
+
+        - name: Download Calico Custom Resources manifest
+          get_url:
+            url: "{{ base_url }}{{ calico_version }}/{{ custom_resources_manifest }}"
+            dest: /tmp/custom-resources.yaml
+
+        - name: Apply Tigera Operator manifest
+          command: kubectl create -f /tmp/tigera-operator.yaml
+
+        - name: Apply Calico Custom Resources manifest
+          command: kubectl create -f /tmp/custom-resources.yaml
         - name: Get join command
           command: kubeadm token create --print-join-command
           register: kubeadm_join
-        - name: Save join command as fact
-          set_fact:
-            join_command: "{{ kubeadm_join.stdout_lines[0] }}"
+        - name: Save join command to a file
+          copy:
+            content: "{{ kubeadm_join.stdout }}"
+            dest: /tmp/join_command.txt
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Fetch join command to controller
+          fetch:
+            src: /tmp/join_command.txt
+            dest: ./output/join_command.txt
+            flat: yes
 
     - name: Enable chronyd service
       systemd:
         name: chronyd
         state: started
         enabled: true
-      when: controlplane in group_names
+      when: "'controlplane' in group_names"
 
   handlers:
     - name: Reload Firewall
