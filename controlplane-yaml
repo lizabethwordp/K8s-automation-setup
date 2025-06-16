@@ -1,0 +1,265 @@
+---
+- name: Bootstrap Kubernetes Control Plane on RHEL 9
+  hosts: controlplane
+  become: true
+  vars:
+    kubernetes_version: "1.31"
+    calico_version: "v3.29.2"
+    pod_network_cidr: "192.168.0.0/16"
+    controlplane_ip: "{{ hostvars[groups['controlplane'][0]]['ansible_host'] | default(hostvars[groups['controlplane'][0]]['inventory_hostname']) }}"
+    docker_ce_repo_url: "https://download.docker.com/linux/rhel/docker-ce.repo"
+    cri_dockerd_version: "0.3.16"
+    cni_plugins_version: "v1.5.0"
+
+  tasks:
+    - name: Disable Swap
+      block:
+        - name: Disable swap immediately
+          command: swapoff -a
+        - name: Comment out swap entries in /etc/fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*swap.*)$'
+            replace: '#\1'
+      when: ansible_os_family == "RedHat"  # Optional: Only if you're sure this is for RHEL-based systems
+
+
+    - name: Configure sysctl parameters
+      block:
+        - name: Create k8s.conf for modules
+          copy:
+            dest: /etc/modules-load.d/k8s.conf
+            content: |
+              overlay
+              br_netfilter
+            owner: root
+            group: root
+            mode: '0644'
+        - name: Load kernel modules
+          command: modprobe "{{ item }}"
+          loop:
+            - overlay
+            - br_netfilter
+        - name: Create k8s.conf for sysctl
+          copy:
+            dest: /etc/sysctl.d/k8s.conf
+            content: |
+              net.bridge.bridge-nf-call-iptables  = 1
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.ipv4.ip_forward      = 1
+            owner: root
+            group: root
+            mode: '0644'
+        - name: Apply sysctl parameters
+          command: sysctl --system
+      when: ansible_os_family == "RedHat"
+
+    - name: Set SELinux to permissive
+      block:
+        - name: Set SELinux to permissive (current session)
+          command: setenforce 0
+          ignore_errors: true
+        - name: Set SELinux to permissive (config file)
+          replace:
+            path: /etc/selinux/config
+            regexp: '^SELINUX=enforcing$'
+            replace: 'SELINUX=permissive'
+      when: ansible_selinux.status != "disabled"
+
+    - name: Open Required Firewall Ports for Control Plane
+      firewalld:
+        port: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - 6443/tcp
+        - 10250/tcp
+        - 10251/tcp
+        - 10252/tcp
+        - 2379-2380/tcp
+
+    - name: Install Docker Engine
+      block:
+        - name: Install dnf-plugins-core
+          dnf:
+            name: dnf-plugins-core
+            state: present
+        - name: Add Docker CE repository
+          command: dnf config-manager --add-repo "{{ docker_ce_repo_url }}"
+        - name: Install Docker Engine, CLI, containerd, buildx, and compose
+          dnf:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+        - name: Set Docker cgroup driver to systemd
+          blockinfile:
+            path: /etc/docker/daemon.json
+            create: true
+            content: |
+              {
+                "exec-opts": ["native.cgroupdriver=systemd"],
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "100m"
+                },
+                "storage-driver": "overlay2"
+              }
+        - name: Start and enable Docker service
+          systemd:
+            name: docker
+            state: restarted
+            enabled: true
+      when: ansible_os_family == "RedHat"
+
+    - name: Install cri-dockerd
+      block:
+        - name: Download cri-dockerd binary
+          get_url:
+            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz"
+            dest: /tmp/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz
+        - name: Extract cri-dockerd binary
+          unarchive:
+            src: /tmp/cri-dockerd-{{ cri_dockerd_version }}-linux-amd64.tgz
+            dest: /tmp/
+            remote_src: true
+        - name: Install cri-dockerd binary
+          command: install -o root -g root -m 0755 /tmp/cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd
+        - name: Create cri-docker.service
+          copy:
+            dest: /etc/systemd/system/cri-docker.service
+            content: |
+              [Unit]
+              Description=CRI Dockerd
+              After=network.target
+              [Service]
+              ExecStart=/usr/local/bin/cri-dockerd --pod-infra-container-image=registry.k8s.io/pause:3.10
+              Restart=always
+              RestartSec=10s
+              LimitNOFILE=infinity
+              LimitNPROC=infinity
+              LimitCORE=infinity
+              TasksMax=infinity
+              [Install]
+              WantedBy=multi-user.target
+            mode: '0644'
+        - name: Create cri-docker.socket
+          copy:
+            dest: /etc/systemd/system/cri-docker.socket
+            content: |
+              [Unit]
+              Description=CRI Dockerd Socket
+              [Socket]
+              ListenStream=/run/cri-dockerd.sock
+              SocketMode=0660
+              SocketUser=root
+              SocketGroup=docker
+              [Install]
+              WantedBy=sockets.target
+            mode: '0644'
+        - name: Reload systemd
+          command: systemctl daemon-reload
+        - name: Enable and start cri-docker services
+          systemd:
+            name: "{{ item }}"
+            state: started
+            enabled: true
+          loop:
+            - cri-docker.service
+            - cri-docker.socket
+      when: ansible_os_family == "RedHat"
+
+    - name: Install CNI plugins
+      block:
+        - name: Download CNI plugins
+          get_url:
+            url: "https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz"
+            dest: /tmp/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz
+        - name: Create CNI bin directory
+          file:
+            path: /opt/cni/bin
+            state: directory
+            mode: '0755'
+        - name: Extract CNI plugins
+          command: tar Cxzvf /tmp/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz -C /opt/cni/bin
+      when: ansible_os_family == "RedHat"
+
+    - name: Install Kubernetes components (kubeadm, kubelet, kubectl)
+      block:
+        - name: Add Kubernetes YUM repository
+          copy:
+            dest: /etc/yum.repos.d/kubernetes.repo
+            content: |
+              [kubernetes]
+              name=Kubernetes
+              baseurl=https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/
+              enabled=1
+              gpgcheck=1
+              repo_gpgcheck=1
+              gpgkey=https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/repodata/repomd.xml.key
+            mode: '0644'
+        - name: Install Kubernetes tools
+          dnf:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+        - name: Install versionlock plugin
+          dnf:
+            name: dnf-command(versionlock)
+            state: present
+        - name: Lock Kubernetes versions
+          command: dnf versionlock add kubelet-{{ kubernetes_version }}* kubeadm-{{ kubernetes_version }}* kubectl-{{ kubernetes_version }}*
+        - name: Enable and start kubelet
+          systemd:
+            name: kubelet
+            state: started
+            enabled: true
+      when: ansible_os_family == "RedHat"
+
+    - name: Initialize Kubernetes Control Plane
+      block:
+        - name: Initialize cluster with kubeadm
+          command: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --apiserver-advertise-address={{ controlplane_ip }} --cri-socket unix:///var/run/cri-dockerd.sock
+          register: kubeadm_init
+        - name: Create .kube config directory
+          file:
+            path: $HOME/.kube
+            state: directory
+        - name: Copy kubeconfig
+          command: cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          become_user: "{{ ansible_user_id }}"
+        - name: Fix kubeconfig permissions
+          command: chown $(id -u):$(id -g) $HOME/.kube/config
+          become_user: "{{ ansible_user_id }}"
+        - name: Deploy Calico
+          kubernetes.core.k8s:
+            state: present
+            src: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml"
+        - name: Apply Calico Custom Resources
+          kubernetes.core.k8s:
+            state: present
+            src: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
+        - name: Get join command
+          command: kubeadm token create --print-join-command
+          register: kubeadm_join
+        - name: Save join command as fact
+          set_fact:
+            join_command: "{{ kubeadm_join.stdout_lines[0] }}"
+
+    - name: Enable chronyd service
+      systemd:
+        name: chronyd
+        state: started
+        enabled: true
+      when: controlplane in group_names
+
+  handlers:
+    - name: Reload Firewall
+      command: firewall-cmd --reload
+      when: ansible_os_family == "RedHat"
